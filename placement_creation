@@ -1,0 +1,583 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any, Set
+import numpy as np
+from datetime import datetime
+from collections import defaultdict
+import uuid
+
+app = FastAPI()
+
+
+# Data models based on the API specification
+class Coordinates(BaseModel):
+    width: float
+    depth: float
+    height: float
+
+
+class Position(BaseModel):
+    startCoordinates: Coordinates
+    endCoordinates: Coordinates
+
+
+class Item(BaseModel):
+    itemId: str
+    name: str
+    width: float
+    depth: float
+    height: float
+    priority: int
+    expiryDate: Optional[str] = None
+    usageLimit: int
+    preferredZone: str
+
+
+class Container(BaseModel):
+    containerId: str
+    zone: str
+    width: float
+    depth: float
+    height: float
+
+
+class Placement(BaseModel):
+    itemId: str
+    containerId: str
+    position: Position
+
+
+class Rearrangement(BaseModel):
+    step: int
+    action: str  # "move", "remove", "place"
+    itemId: str
+    fromContainer: str
+    fromPosition: Position
+    toContainer: str
+    toPosition: Position
+
+
+class PlacementRequest(BaseModel):
+    items: List[Item]
+    containers: List[Container]
+
+
+class PlacementResponse(BaseModel):
+    success: bool
+    placements: List[Placement]
+    rearrangements: List[Rearrangement]
+
+
+# Improved data structures for container management
+class ContainerManager:
+    def __init__(self):
+        self.container_space = {}  # Maps container ID to 3D numpy array
+        self.free_spaces = defaultdict(list)  # Maps container ID to list of free spaces
+        self.placed_items = {}  # Maps item ID to placement information
+        self.container_metadata = {}  # Stores container metadata for future reference
+        self.active_container_ids = set()  # Tracks which containers are currently active
+
+    def register_container(self, container: Container) -> None:
+        """Register a new container in the system."""
+        container_id = container.containerId
+        w, d, h = int(container.width), int(container.depth), int(container.height)
+
+        # Store the container space representation
+        self.container_space[container_id] = np.zeros((w, d, h), dtype=int)
+
+        # Initialize free space with the entire container
+        self.free_spaces[container_id] = [(0, 0, 0, w, d, h)]  # (x, y, z, width, depth, height)
+
+        # Store container metadata
+        self.container_metadata[container_id] = {
+            "zone": container.zone,
+            "dimensions": (w, d, h),
+            "total_volume": w * d * h,
+            "used_volume": 0,
+            "item_count": 0,
+            "creation_time": datetime.now().isoformat()
+        }
+
+        # Add to active containers
+        self.active_container_ids.add(container_id)
+
+    def deactivate_container(self, container_id: str) -> bool:
+        """Mark a container as inactive (for future use)."""
+        if container_id in self.active_container_ids:
+            self.active_container_ids.remove(container_id)
+            return True
+        return False
+
+    def reactivate_container(self, container_id: str) -> bool:
+        """Reactivate a previously deactivated container."""
+        if container_id in self.container_metadata and container_id not in self.active_container_ids:
+            self.active_container_ids.add(container_id)
+            return True
+        return False
+
+    def get_container_stats(self, container_id: str = None) -> Dict:
+        """Get statistics about containers usage."""
+        if container_id:
+            if container_id in self.container_metadata:
+                return self.container_metadata[container_id]
+            return None
+
+        # Return stats for all containers
+        stats = {
+            "total_containers": len(self.container_metadata),
+            "active_containers": len(self.active_container_ids),
+            "inactive_containers": len(self.container_metadata) - len(self.active_container_ids),
+            "containers": self.container_metadata
+        }
+        return stats
+
+    def get_active_containers(self) -> Set[str]:
+        """Get IDs of all active containers."""
+        return self.active_container_ids
+
+    def check_fit(self, free_space, item_w, item_d, item_h) -> bool:
+        """Check if an item fits in the given free space."""
+        x, y, z, space_w, space_d, space_h = free_space
+        return item_w <= space_w and item_d <= space_d and item_h <= space_h
+
+    def update_free_spaces(self, container_id, used_space, item_w, item_d, item_h) -> None:
+        """Update the free spaces list after placing an item."""
+        x, y, z = used_space
+
+        # Remove the used space from the free spaces list
+        current_spaces = self.free_spaces[container_id]
+        new_spaces = []
+
+        for space in current_spaces:
+            sx, sy, sz, sw, sd, sh = space
+
+            # If the current free space doesn't overlap with the used space, keep it
+            if (sx + sw <= x or sx >= x + item_w or
+                    sy + sd <= y or sy >= y + item_d or
+                    sz + sh <= z or sz >= z + item_h):
+                new_spaces.append(space)
+                continue
+
+            # Split the current free space into up to 6 new spaces
+            # Right of the item
+            if sx + sw > x + item_w:
+                new_spaces.append((x + item_w, sy, sz, sx + sw - (x + item_w), sd, sh))
+
+            # Left of the item
+            if x > sx:
+                new_spaces.append((sx, sy, sz, x - sx, sd, sh))
+
+            # Behind the item
+            if sy + sd > y + item_d:
+                new_spaces.append((sx, y + item_d, sz, sw, sy + sd - (y + item_d), sh))
+
+            # In front of the item
+            if y > sy:
+                new_spaces.append((sx, sy, sz, sw, y - sy, sh))
+
+            # Above the item
+            if sz + sh > z + item_h:
+                new_spaces.append((sx, sy, z + item_h, sw, sd, sz + sh - (z + item_h)))
+
+            # Below the item
+            if z > sz:
+                new_spaces.append((sx, sy, sz, sw, sd, z - sz))
+
+        # Optimize free spaces
+        self.free_spaces[container_id] = self.optimize_free_spaces(new_spaces)
+
+        # Update container metadata
+        item_volume = item_w * item_d * item_h
+        self.container_metadata[container_id]["used_volume"] += item_volume
+        self.container_metadata[container_id]["item_count"] += 1
+
+    def optimize_free_spaces(self, spaces) -> List:
+        """Optimize the list of free spaces by removing contained spaces."""
+        # Sort spaces by volume (largest first)
+        sorted_spaces = sorted(spaces, key=lambda s: s[3] * s[4] * s[5], reverse=True)
+
+        # Remove spaces that are completely contained within larger spaces
+        result = []
+        for i, space1 in enumerate(sorted_spaces):
+            x1, y1, z1, w1, d1, h1 = space1
+            contained = False
+
+            for j, space2 in enumerate(sorted_spaces):
+                if i == j:
+                    continue
+
+                x2, y2, z2, w2, d2, h2 = space2
+                if (x1 >= x2 and y1 >= y2 and z1 >= z2 and
+                        x1 + w1 <= x2 + w2 and y1 + d1 <= y2 + d2 and z1 + h1 <= z2 + h2):
+                    contained = True
+                    break
+
+            if not contained:
+                result.append(space1)
+
+        return result
+
+    def place_item(self, container_id: str, item: Item, pos_x: int, pos_y: int, pos_z: int,
+                   item_w: int, item_d: int, item_h: int) -> Position:
+        """Place an item in a container at a specific position."""
+        # Make sure the container is active
+        if container_id not in self.active_container_ids:
+            raise ValueError(f"Container {container_id} is not active")
+
+        container_array = self.container_space[container_id]
+
+        # Mark the space as occupied with the item ID
+        item_id_int = int(item.itemId) if item.itemId.isdigit() else hash(item.itemId) % 10000
+        container_array[pos_x:pos_x + item_w, pos_y:pos_y + item_d, pos_z:pos_z + item_h] = item_id_int
+
+        # Update free spaces
+        self.update_free_spaces(container_id, (pos_x, pos_y, pos_z), item_w, item_d, item_h)
+
+        # Record the placement
+        position = Position(
+            startCoordinates=Coordinates(width=float(pos_x), depth=float(pos_y), height=float(pos_z)),
+            endCoordinates=Coordinates(width=float(pos_x + item_w), depth=float(pos_y + item_d),
+                                       height=float(pos_z + item_h))
+        )
+
+        self.placed_items[item.itemId] = {
+            "containerId": container_id,
+            "position": position,
+            "dimensions": (item_w, item_d, item_h),
+            "placement_time": datetime.now().isoformat()
+        }
+
+        return position
+
+    def find_optimal_placement(self, item: Item, containers: List[Container]) -> Optional[Dict[str, Any]]:
+        """Find the best placement for an item using Extreme Point-Based Best Fit Decreasing algorithm."""
+        # Precompute all valid item orientations
+        item_orientations = []
+        dimensions = (int(item.width), int(item.depth), int(item.height))
+
+        for i in range(3):
+            for j in range(3):
+                if j != i:
+                    for k in range(3):
+                        if k != i and k != j:
+                            item_orientations.append((
+                                dimensions[i],
+                                dimensions[j],
+                                dimensions[k]
+                            ))
+
+        # Remove duplicate orientations
+        unique_orientations = []
+        for orientation in item_orientations:
+            if orientation not in unique_orientations:
+                unique_orientations.append(orientation)
+
+        # Sort containers by preferred zone first, but only consider active containers
+        active_containers = [c for c in containers if c.containerId in self.active_container_ids]
+        preferred_containers = [c for c in active_containers if c.zone == item.preferredZone]
+        other_containers = [c for c in active_containers if c not in preferred_containers]
+        sorted_containers = preferred_containers + other_containers
+
+        best_placement = None
+        best_waste = float('inf')
+
+        for container in sorted_containers:
+            container_id = container.containerId
+
+            for item_w, item_d, item_h in unique_orientations:
+                # Skip if orientation doesn't fit in container
+                if (item_w > int(container.width) or
+                        item_d > int(container.depth) or
+                        item_h > int(container.height)):
+                    continue
+
+                # Find the best free space for this orientation
+                for free_space in self.free_spaces[container_id]:
+                    x, y, z, space_w, space_d, space_h = free_space
+
+                    if self.check_fit(free_space, item_w, item_d, item_h):
+                        # Calculate wasted space (we want to minimize this)
+                        waste = (space_w * space_d * space_h) - (item_w * item_d * item_h)
+
+                        # If in preferred zone, give priority by reducing waste
+                        if container.zone == item.preferredZone:
+                            waste *= 0.8
+
+                        # We want to place item at the bottom front left corner of the free space
+                        if waste < best_waste:
+                            best_waste = waste
+                            best_placement = {
+                                "containerId": container_id,
+                                "position": (x, y, z),
+                                "dimensions": (item_w, item_d, item_h),
+                                "inPreferredZone": container.zone == item.preferredZone
+                            }
+
+        if best_placement:
+            pos_x, pos_y, pos_z = best_placement["position"]
+            item_w, item_d, item_h = best_placement["dimensions"]
+            position = self.place_item(
+                best_placement["containerId"],
+                item,
+                pos_x, pos_y, pos_z,
+                item_w, item_d, item_h
+            )
+
+            best_placement["position"] = position
+
+        return best_placement
+
+    def remove_item(self, item_id: str) -> bool:
+        """Remove an item from its container."""
+        if item_id not in self.placed_items:
+            return False
+
+        placement = self.placed_items[item_id]
+        container_id = placement["containerId"]
+        position = placement["position"]
+        item_w, item_d, item_h = placement["dimensions"]
+
+        # Get the coordinates
+        start_x = int(position.startCoordinates.width)
+        start_y = int(position.startCoordinates.depth)
+        start_z = int(position.startCoordinates.height)
+
+        # Clear the space in the container
+        container_array = self.container_space[container_id]
+        container_array[start_x:start_x + item_w, start_y:start_y + item_d, start_z:start_z + item_h] = 0
+
+        # Add the freed space back to free spaces
+        self.free_spaces[container_id].append((start_x, start_y, start_z, item_w, item_d, item_h))
+        self.free_spaces[container_id] = self.optimize_free_spaces(self.free_spaces[container_id])
+
+        # Update container metadata
+        item_volume = item_w * item_d * item_h
+        self.container_metadata[container_id]["used_volume"] -= item_volume
+        self.container_metadata[container_id]["item_count"] -= 1
+
+        # Remove from placed items
+        del self.placed_items[item_id]
+
+        return True
+
+    def generate_container_id(self) -> str:
+        """Generate a unique container ID for future use."""
+        return f"container-{uuid.uuid4().hex[:8]}"
+
+
+# Instantiate the container manager
+container_manager = ContainerManager()
+
+
+def prioritize_items(items: List[Item]) -> List[Item]:
+    """Sort items by priority and volume for better packing."""
+    # Calculate volume for each item
+    items_with_metrics = []
+    for item in items:
+        volume = item.width * item.depth * item.height
+        # Combine priority and volume into a single score
+        score = (item.priority * 1000) + volume
+        items_with_metrics.append((item, score))
+
+    # Sort by score (descending)
+    sorted_items = [item for item, _ in sorted(items_with_metrics, key=lambda x: x[1], reverse=True)]
+    return sorted_items
+
+
+def find_rearrangements(items_to_place: List[Item], containers: List[Container]) -> List[Rearrangement]:
+    """Determine if rearrangements are needed to accommodate high-priority items."""
+    rearrangements = []
+    step_counter = 1
+
+    # Only consider rearrangements if we have high-priority unplaced items
+    high_priority_items = [item for item in items_to_place if item.priority > 5]
+
+    if not high_priority_items:
+        return rearrangements
+
+    # Find items that can be moved to make space for high priority items
+    for item_id, placement in list(container_manager.placed_items.items())[:5]:
+        # Skip if the item is already in a good position
+        if placement.get("inPreferredZone", False):
+            continue
+
+        # Find an alternative container for this item
+        from_container_id = placement["containerId"]
+        from_position = placement["position"]
+
+        # Find another container with enough space
+        for container in containers:
+            if container.containerId == from_container_id or container.containerId not in container_manager.active_container_ids:
+                continue
+
+            # Check if there's enough space in this container
+            item_w, item_d, item_h = placement["dimensions"]
+            can_fit = False
+
+            for free_space in container_manager.free_spaces[container.containerId]:
+                if container_manager.check_fit(free_space, item_w, item_d, item_h):
+                    x, y, z, _, _, _ = free_space
+                    can_fit = True
+
+                    # Create a rearrangement
+                    to_position = Position(
+                        startCoordinates=Coordinates(width=float(x), depth=float(y), height=float(z)),
+                        endCoordinates=Coordinates(
+                            width=float(x + item_w),
+                            depth=float(y + item_d),
+                            height=float(z + item_h)
+                        )
+                    )
+
+                    rearrangements.append(Rearrangement(
+                        step=step_counter,
+                        action="move",
+                        itemId=item_id,
+                        fromContainer=from_container_id,
+                        fromPosition=from_position,
+                        toContainer=container.containerId,
+                        toPosition=to_position
+                    ))
+
+                    step_counter += 1
+                    break
+
+            if can_fit:
+                break
+
+    return rearrangements
+
+
+# API Endpoints
+@app.post("/api/placement", response_model=PlacementResponse)
+async def placement_recommendations(request: PlacementRequest):
+    try:
+        # Register containers
+        for container in request.containers:
+            container_manager.register_container(container)
+
+        # Sort items by priority and volume
+        sorted_items = prioritize_items(request.items)
+
+        # Attempt to place all items
+        placements = []
+        unplaced_items = []
+
+        for item in sorted_items:
+            placement = container_manager.find_optimal_placement(item, request.containers)
+
+            if placement:
+                placements.append(Placement(
+                    itemId=item.itemId,
+                    containerId=placement["containerId"],
+                    position=placement["position"]
+                ))
+            else:
+                unplaced_items.append(item)
+
+        # If there are unplaced items, try to rearrange
+        rearrangements = []
+        if unplaced_items:
+            rearrangements = find_rearrangements(unplaced_items, request.containers)
+
+            # After rearranging, try to place the remaining items
+            # This is simplified - in reality, you'd perform the actual rearrangements
+            if rearrangements:
+                # Try placing unplaced items again
+                remaining_unplaced = []
+                for item in unplaced_items:
+                    placement = container_manager.find_optimal_placement(item, request.containers)
+                    if placement:
+                        placements.append(Placement(
+                            itemId=item.itemId,
+                            containerId=placement["containerId"],
+                            position=placement["position"]
+                        ))
+                    else:
+                        remaining_unplaced.append(item)
+                unplaced_items = remaining_unplaced
+
+        # If some items still can't be placed, report success=False
+        if unplaced_items:
+            return PlacementResponse(
+                success=False,
+                placements=placements,
+                rearrangements=rearrangements
+            )
+
+        return PlacementResponse(
+            success=True,
+            placements=placements,
+            rearrangements=rearrangements
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Additional endpoints for container management
+@app.post("/api/containers/create")
+async def create_container(container: Container):
+    """Create a new container."""
+    try:
+        container_manager.register_container(container)
+        return {"success": True, "containerId": container.containerId}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/containers/deactivate/{container_id}")
+async def deactivate_container(container_id: str):
+    """Deactivate a container for future use."""
+    success = container_manager.deactivate_container(container_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Container {container_id} not found or already inactive")
+    return {"success": True}
+
+
+@app.post("/api/containers/reactivate/{container_id}")
+async def reactivate_container(container_id: str):
+    """Reactivate a previously deactivated container."""
+    success = container_manager.reactivate_container(container_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Container {container_id} not found or already active")
+    return {"success": True}
+
+
+@app.get("/api/containers/stats")
+async def get_container_stats(container_id: Optional[str] = None):
+    """Get container statistics."""
+    stats = container_manager.get_container_stats(container_id)
+    if container_id and not stats:
+        raise HTTPException(status_code=404, detail=f"Container {container_id} not found")
+    return stats
+
+
+@app.post("/api/containers/generate-id")
+async def generate_container_id():
+    """Generate a unique container ID for future use."""
+    return {"containerId": container_manager.generate_container_id()}
+
+
+@app.get("/api/items/{item_id}")
+async def get_item_placement(item_id: str):
+    """Get the placement details of an item."""
+    if item_id not in container_manager.placed_items:
+        raise HTTPException(status_code=404, detail=f"Item {item_id} not found")
+    return container_manager.placed_items[item_id]
+
+
+@app.delete("/api/items/{item_id}")
+async def remove_item(item_id: str):
+    """Remove an item from its container."""
+    success = container_manager.remove_item(item_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Item {item_id} not found")
+    return {"success": True}
+
+
+# You would typically include these in a main.py file to run the API
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
